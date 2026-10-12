@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Achernar</title>
+</head>
+<body>
+<h1>Achernar</h1>
+<p>Achernar is a dedicated NVDA speech synthesizer for a single Piper voice.
+It runs fully offline; the voice model, the espeak-ng runtime, and the
+synthesis engine all ship inside the add-on.</p>
+
+<h2>Settings</h2>
+<ul>
+<li><strong>Rate</strong>, <strong>Rate boost</strong>, <strong>Pitch</strong>,
+and <strong>Volume</strong>: the usual NVDA speech controls.</li>
+<li><strong>Expressiveness</strong>: how much the voice varies its delivery.
+50 keeps the voice exactly as trained; lower is flatter and steadier, higher
+is more varied.</li>
+<li><strong>Show advanced voice parameters</strong>: reveals Piper's own
+inference controls. Each is a percentage of the voice's trained value, where
+50 is that value.</li>
+</ul>
+
+<h3>Advanced parameters</h3>
+<ul>
+<li><strong>Noise scale (variability)</strong>: Piper's <code>noise_scale</code>.</li>
+<li><strong>Noise W (phoneme length variation)</strong>: Piper's <code>noise_w</code>.</li>
+<li><strong>Length scale (model pace)</strong>: Piper's <code>length_scale</code>.</li>
+</ul>
+
+<h2>Notes</h2>
+<p>This add-on deliberately has no voice catalog, no downloads, no lexicon,
+and no automatic language switching. It always speaks with its one bundled
+voice.</p>
+</body>
+</html>

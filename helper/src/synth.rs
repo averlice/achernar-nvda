@@ -1,0 +1,191 @@
+//! Piper (VITS) inference. Each Piper voice is a separate ONNX model, so the
+//! engine keeps a small LRU of loaded voice sessions to bound memory while
+//! avoiding reloads on the hot path.
+
+use crate::config::{self, PhonemeType, VoiceConfig};
+use crate::protocol::Scales;
+use anyhow::{anyhow, Context, Result};
+use ort::session::builder::GraphOptimizationLevel;
+use ort::session::Session;
+use ort::value::Tensor;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// ort's error type is not Send+Sync; stringify it so it flows through anyhow.
+fn ort_err<T, R>(r: std::result::Result<T, ort::Error<R>>) -> Result<T> {
+    r.map_err(|e| anyhow!("onnxruntime: {e}"))
+}
+
+struct Loaded {
+    session: Session,
+    config: VoiceConfig,
+    has_sid: bool,
+    used: u64,
+}
+
+pub struct Engine {
+    voices: HashMap<PathBuf, Loaded>,
+    threads: usize,
+    clock: u64,
+    max_loaded: usize,
+}
+
+/// Synthesis result: raw model samples plus the voice's native sample rate.
+pub struct Synth {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+impl Engine {
+    pub fn new(threads: usize) -> Self {
+        Self {
+            voices: HashMap::new(),
+            threads,
+            clock: 0,
+            max_loaded: 3,
+        }
+    }
+
+    fn ensure_loaded(&mut self, model_path: &Path) -> Result<()> {
+        if self.voices.contains_key(model_path) {
+            return Ok(());
+        }
+        let config_path = config_path_for(model_path);
+        let config = VoiceConfig::load(&config_path)?;
+        let mut builder = ort_err(ort_err(ort_err(Session::builder())?
+            .with_optimization_level(GraphOptimizationLevel::Level3))?
+            .with_intra_threads(self.threads.max(1)))?;
+        let session = ort_err(builder.commit_from_file(model_path))
+            .with_context(|| format!("loading model {}", model_path.display()))?;
+        let has_sid = session.inputs().iter().any(|i| i.name() == "sid");
+
+        if self.voices.len() >= self.max_loaded {
+            self.evict_lru();
+        }
+        self.clock += 1;
+        self.voices.insert(
+            model_path.to_path_buf(),
+            Loaded {
+                session,
+                config,
+                has_sid,
+                used: self.clock,
+            },
+        );
+        Ok(())
+    }
+
+    fn evict_lru(&mut self) {
+        if let Some(oldest) = self
+            .voices
+            .iter()
+            .min_by_key(|(_, v)| v.used)
+            .map(|(k, _)| k.clone())
+        {
+            self.voices.remove(&oldest);
+        }
+    }
+
+    /// The espeak voice tag configured for a model (loads it if needed).
+    pub fn espeak_voice(&mut self, model_path: &Path) -> Result<String> {
+        self.ensure_loaded(model_path)?;
+        Ok(self.voices[model_path].config.espeak_voice.clone())
+    }
+
+    /// How this voice's phonemes are produced.
+    ///
+    /// Reads the configuration alone when the voice is not already loaded, so
+    /// a voice this helper cannot speak is refused without loading its model.
+    pub fn phoneme_type(&self, model_path: &Path) -> Result<PhonemeType> {
+        if let Some(loaded) = self.voices.get(model_path) {
+            return Ok(loaded.config.phoneme_type.clone());
+        }
+        config::phoneme_type_of(&config_path_for(model_path))
+    }
+
+    /// Synthesize IPA phonemes with the given model. NVDA's rate is applied
+    /// later as post-cache time-stretch, so `scales.length_scale` is a
+    /// deliberate extra control rather than the rate setting, and stays at
+    /// 1.0 unless the user asks for something else.
+    pub fn synth(
+        &mut self,
+        model_path: &Path,
+        ipa: &str,
+        sid: i64,
+        scales: Scales,
+    ) -> Result<Option<Synth>> {
+        self.ensure_loaded(model_path)?;
+        self.clock += 1;
+        let clock = self.clock;
+        let loaded = self.voices.get_mut(model_path).unwrap();
+        loaded.used = clock;
+
+        // A voice can ask for silence after particular phonemes. Piper
+        // handles that by synthesizing around the silence rather than through
+        // it, so the model never sees the gap; do the same. Voices without
+        // `phoneme_silence`, which is nearly all of them, get one part and
+        // one model run.
+        let sample_rate = loaded.config.sample_rate;
+        let parts = loaded.config.split_on_silence(ipa);
+        let mut samples: Vec<f32> = Vec::new();
+        let mut matched_total = 0usize;
+        for (phonemes, silence_seconds) in parts {
+            let (ids, matched) = loaded.config.phonemes_to_ids(&phonemes);
+            if matched > 0 {
+                matched_total += matched;
+                samples.extend(run_model(loaded, ids, sid, scales)?);
+            }
+            if silence_seconds > 0.0 && matched_total > 0 {
+                let count = (silence_seconds * sample_rate as f32) as usize;
+                samples.extend(std::iter::repeat_n(0.0f32, count));
+            }
+        }
+        if matched_total == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Synth {
+            samples,
+            sample_rate,
+        }))
+    }
+}
+
+/// One model run over an already-built id sequence.
+fn run_model(loaded: &mut Loaded, ids: Vec<i64>, sid: i64, scales: Scales) -> Result<Vec<f32>> {
+    let n = ids.len();
+    let clamp = |value: f32| value.clamp(0.0, 2.0);
+    let model_scales = vec![
+        loaded.config.noise_scale * clamp(scales.noise_scale),
+        loaded.config.length_scale * clamp(scales.length_scale),
+        loaded.config.noise_w * clamp(scales.noise_w),
+    ];
+    let input = ort_err(Tensor::from_array(([1usize, n], ids)))?;
+    let input_lengths = ort_err(Tensor::from_array(([1usize], vec![n as i64])))?;
+    let scales_t = ort_err(Tensor::from_array(([3usize], model_scales)))?;
+
+    let outputs = if loaded.has_sid {
+        let sid_t = ort_err(Tensor::from_array(([1usize], vec![sid])))?;
+        ort_err(loaded.session.run(ort::inputs![
+            "input" => input,
+            "input_lengths" => input_lengths,
+            "scales" => scales_t,
+            "sid" => sid_t,
+        ]))?
+    } else {
+        ort_err(loaded.session.run(ort::inputs![
+            "input" => input,
+            "input_lengths" => input_lengths,
+            "scales" => scales_t,
+        ]))?
+    };
+    let (_, data) = ort_err(outputs[0].try_extract_tensor::<f32>())
+        .context("extracting model output")?;
+    Ok(data.to_vec())
+}
+
+/// `foo.onnx` -> `foo.onnx.json`.
+pub fn config_path_for(model_path: &Path) -> PathBuf {
+    let mut s = model_path.as_os_str().to_os_string();
+    s.push(".json");
+    PathBuf::from(s)
+}
