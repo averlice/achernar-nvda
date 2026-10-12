@@ -549,14 +549,28 @@ def _clamp_percent(value):
 
 
 def _create_player():
+    """Build the WavePlayer, routed to NVDA's configured audio output device.
+
+    NVDA routes audio through ``config.conf["audio"]["outputDevice"]``, and
+    passing it to WavePlayer is what makes this synth follow the same device
+    as NVDA's sounds and tones (compare nvwave.playWaveFile). Leaving
+    ``outputDevice`` at its default opens the system default device instead,
+    which is why the synth ignored the audio routing setting.
+    """
     kwargs = dict(channels=1, samplesPerSec=SAMPLE_RATE, bitsPerSample=16,
                   wantDucking=True)
+    try:
+        outputDevice = config.conf["audio"]["outputDevice"]
+    except (KeyError, TypeError):
+        outputDevice = None
+    if outputDevice is not None:
+        kwargs["outputDevice"] = outputDevice
     try:
         return nvwave.WavePlayer(purpose=nvwave.AudioPurpose.SPEECH, **kwargs)
     except (AttributeError, TypeError):
         pass
     try:
-        outputDevice = config.conf["speech"]["outputDevice"]
-        return nvwave.WavePlayer(outputDevice=outputDevice, **kwargs)
+        return nvwave.WavePlayer(**kwargs)
     except TypeError:
+        kwargs.pop("outputDevice", None)
         return nvwave.WavePlayer(**kwargs)
